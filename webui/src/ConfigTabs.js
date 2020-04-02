@@ -26,12 +26,13 @@ import PTP from './PTP';
 import Config from './Config';
 import Sources from './Sources';
 import Sinks from './Sinks';
+import RemoteSources from './RemoteSources';
 
 require('./styles.css');
 
 class ConfigTabs extends Component {
   static propTypes = {
-    currentTab: PropTypes.func.isRequired
+    currentTab: PropTypes.string.isRequired
   };
 
   render() {
@@ -50,6 +51,9 @@ class ConfigTabs extends Component {
           </div>
           <div label="Sinks">
             <Sinks/>
+          </div>
+          <div label="Browser">
+            <RemoteSources/>
           </div>
         </Tabs>
        </div>

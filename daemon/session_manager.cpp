@@ -18,11 +18,13 @@
 //
 
 #define CPPHTTPLIB_PAYLOAD_MAX_LENGTH 4096 //max for SDP file 
+#define CPPHTTPLIB_READ_TIMEOUT_SECOND 10
 #include <httplib.h>
 #include <boost/algorithm/string.hpp>
 #include <boost/foreach.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
+#include <boost/algorithm/string.hpp>
 #include <experimental/map>
 #include <iostream>
 #include <chrono>
@@ -32,6 +34,9 @@
 #include "json.hpp"
 #include "log.hpp"
 #include "session_manager.hpp"
+#include "utils.hpp"
+#include "rtsp_client.hpp"
+
 
 static uint8_t get_codec_word_lenght(const std::string& codec) {
   if (codec == "L16") {
@@ -121,6 +126,7 @@ bool SessionManager::parse_sdp(const std::string sdp, StreamInfo& info) const {
     std::stringstream ssstrem(sdp);
     std::string line;
     while (getline(ssstrem, line, '\n')) {
+      boost::trim(line);
       ++num;
       if (line[1] != '=') {
         BOOST_LOG_TRIVIAL(error)
@@ -288,7 +294,7 @@ bool SessionManager::parse_sdp(const std::string sdp, StreamInfo& info) const {
     }
   } catch (...) {
     BOOST_LOG_TRIVIAL(fatal) << "session_manager:: invalid SDP at line " << num
-                             << ", cannot perform number convesrion";
+                             << ", cannot perform number conversion";
     return false;
   }
 
@@ -439,6 +445,16 @@ bool SessionManager::save_status() {
   return true;
 }
 
+static std::array<uint8_t, 6> get_mcast_mac_addr(uint32_t mcast_ip) {
+  // As defined by IANA, the most significant 24 bits of an IPv4 multicast
+  // MAC address are 0x01005E.  // Bit 25 is 0, and the other 23 bits are the
+  // least significant 23 bits of an IPv4 multicast address.
+  return { 0x01, 0x00, 0x5e,
+           static_cast<uint8_t>((mcast_ip >> 16) & 0x7F),
+           static_cast<uint8_t>(mcast_ip >> 8),
+           static_cast<uint8_t>(mcast_ip) };
+}
+
 std::error_code SessionManager::add_source(const StreamSource& source) {
   if (source.id > stream_id_max) {
     BOOST_LOG_TRIVIAL(error) << "session_manager:: source id "
@@ -471,8 +487,10 @@ std::error_code SessionManager::add_source(const StreamSource& source) {
   info.stream.m_usDestPort = config_->get_rtp_port();
   info.stream.m_ui32SSRC = rand() % 65536; // use random number
   std::copy(source.map.begin(), source.map.end(), info.stream.m_aui32Routing);
-  std::copy(std::begin(config_->get_mac_addr()), std::end(config_->get_mac_addr()),
+  auto mcast_mac_addr = get_mcast_mac_addr(info.stream.m_ui32DestIP);
+  std::copy(std::begin(mcast_mac_addr), std::end(mcast_mac_addr),
             info.stream.m_ui8DestMAC);
+
   info.refclk_ptp_traceable = source.refclk_ptp_traceable;
   info.enabled = source.enabled;
   info.io = source.io;
@@ -482,11 +500,12 @@ std::error_code SessionManager::add_source(const StreamSource& source) {
   auto const it = sources_.find(source.id);
   if (it != sources_.end()) {
     BOOST_LOG_TRIVIAL(info) << "session_manager:: source id "
-                             << std::to_string(source.id) << " is in use, updating";
-    const auto& info = (*it).second;
+                        << std::to_string(source.id) << " is in use, updating";
     // remove previous stream if enabled
-    if (info.enabled) {
-      (void)driver_->remove_rtp_stream(info.handle);
+    if ((*it).second.enabled) {
+      (void)driver_->remove_rtp_stream((*it).second.handle);
+      igmp_.leave(config_->get_ip_addr_str(),
+           ip::address_v4((*it).second.stream.m_ui32DestIP).to_string());
     }
   }
 
@@ -497,17 +516,11 @@ std::error_code SessionManager::add_source(const StreamSource& source) {
       if (it != sources_.end()) {
         /* update operation failed */
         sources_.erase(source.id);
-        igmp_.leave(config_->get_ip_addr_str(),
-                    ip::address_v4(info.stream.m_ui32DestIP).to_string());
       }
       return ret;
     }
-
-    if (it == sources_.end()) {
-      /* if add join multicast */
-      igmp_.join(config_->get_ip_addr_str(),
-                 ip::address_v4(info.stream.m_ui32DestIP).to_string());
-    }
+    igmp_.join(config_->get_ip_addr_str(),
+               ip::address_v4(info.stream.m_ui32DestIP).to_string());
   }
  
   // update source map 
@@ -536,7 +549,8 @@ std::string SessionManager::get_source_sdp_(uint32_t id,
            << static_cast<double>(info.stream.m_ui32MaxSamplesPerPacket) * 1000 /
               static_cast<double>(sample_rate);
   std::string ptime = ss_ptime.str();
-  ptime.erase(ptime.find_last_not_of('0') + 1, std::string::npos); // remove trailing zeros
+  // remove trailing zeros or dot 
+  ptime.erase(ptime.find_last_not_of("0.") + 1, std::string::npos);
 
   // build SDP
   std::stringstream ss;
@@ -645,59 +659,71 @@ std::error_code SessionManager::add_sink(const StreamSink& sink) {
       return DaemonErrc::invalid_url;
     }
 
-    if (!boost::iequals(protocol, "http")) {
-      BOOST_LOG_TRIVIAL(error)
-          << "session_manager:: unsupported protocol in URL " << sink.source;
-      return DaemonErrc::invalid_url;
-    }
-
-    httplib::Client cli(host.c_str(),
-                        !atoi(port.c_str()) ? 80 : atoi(port.c_str()));
-    cli.set_timeout_sec(10);
-    auto res = cli.Get(path.c_str());
-    if (!res) {
-      BOOST_LOG_TRIVIAL(error)
-          << "session_manager:: cannot retrieve SDP from URL " << sink.source;
-      return DaemonErrc::cannot_retrieve_sdp;
-    }
-
-    if (res->status != 200) {
-      BOOST_LOG_TRIVIAL(error)
-          << "session_manager:: cannot retrieve SDP from URL " << sink.source
-          << " server reply " << res->status;
-      return DaemonErrc::cannot_retrieve_sdp;
+    std::string sdp;
+    if (boost::iequals(protocol, "http")) {
+      httplib::Client cli(host.c_str(),
+                          !atoi(port.c_str()) ? 80 : atoi(port.c_str()));
+      cli.set_timeout_sec(10);
+      auto res = cli.Get(path.c_str());
+      if (!res) {
+        BOOST_LOG_TRIVIAL(error)
+            << "session_manager:: annot retrieve SDP from URL " << sink.source;
+        return DaemonErrc::cannot_retrieve_sdp;
+      }
+      if (res->status != 200) {
+        BOOST_LOG_TRIVIAL(error)
+            << "session_manager:: cannot retrieve SDP from URL " << sink.source
+            << " server reply " << res->status;
+        return DaemonErrc::cannot_retrieve_sdp;
+      }
+      sdp = std::move(res->body);
+    } else if (boost::iequals(protocol, "rtsp")) {
+      auto res = RTSPClient::describe(path, host, port);
+      if (!res.first) {
+        BOOST_LOG_TRIVIAL(error)
+            << "session_manager:: cannot retrieve SDP from URL " << sink.source;
+        return DaemonErrc::cannot_retrieve_sdp;
+      }
+      sdp = std::move(res.second.sdp);
+    } else {
+        BOOST_LOG_TRIVIAL(error)
+            << "session_manager:: unsupported protocol in URL " << sink.source;
+        return DaemonErrc::invalid_url;
     }
 
     BOOST_LOG_TRIVIAL(info)
         << "session_manager:: SDP from URL " << sink.source << " :\n"
-        << res->body;
+        << sdp;
 
-    if (!parse_sdp(res->body, info)) {
+    if (!parse_sdp(sdp, info)) {
       return DaemonErrc::cannot_parse_sdp;
     }
 
-    info.sink_sdp = res->body;
+    info.sink_sdp = std::move(sdp);
   } else {
-    BOOST_LOG_TRIVIAL(info) << "session_manager:: using SDP " << sink.sdp;
+    BOOST_LOG_TRIVIAL(info) << "session_manager:: using SDP "
+                            << std::endl << sink.sdp;
     if (!parse_sdp(sink.sdp, info)) {
       return DaemonErrc::cannot_parse_sdp;
     }
 
-    info.sink_sdp = sink.sdp;
+    info.sink_sdp = std::move(sink.sdp);
   }
   info.sink_source = sink.source;
   info.sink_use_sdp = true; // save back and use with SDP file
 
-  info.stream.m_ui32FrameSize = info.stream.m_ui32MaxSamplesPerPacket * 
-    info.stream.m_byNbOfChannels * info.stream.m_byWordLength;
+  info.stream.m_ui32FrameSize = info.stream.m_ui32MaxSamplesPerPacket;
   if (!info.stream.m_ui32FrameSize) {
     // if not from SDP use config
     info.stream.m_ui32FrameSize = config_->get_max_tic_frame_size();
   }
+ 
   BOOST_LOG_TRIVIAL(info) << "session_manager:: sink samples per packet " << 
     info.stream.m_ui32MaxSamplesPerPacket;
   BOOST_LOG_TRIVIAL(info) << "session_manager:: sink frame size " << 
     info.stream.m_ui32FrameSize;
+  BOOST_LOG_TRIVIAL(info) << "session_manager:: playout delay " << 
+    info.stream.m_ui32PlayOutDelay;
 
   // info.m_ui32SrcIP = addr;  // only for Source
   // info.m_usSrcPort = 5004;
@@ -705,16 +731,19 @@ std::error_code SessionManager::add_sink(const StreamSink& sink) {
   // info.m_ui32SSRC = 65544;
   // info.m_ucDSCP = source.dscp; 
   // info.m_byTTL = source.ttl;
-  // info.m_ui8DestMAC
+  auto mcast_mac_addr = get_mcast_mac_addr(info.stream.m_ui32DestIP);
+  std::copy(std::begin(mcast_mac_addr), std::end(mcast_mac_addr),
+            info.stream.m_ui8DestMAC);
 
   std::unique_lock sinks_lock(sinks_mutex_);
   auto const it = sinks_.find(sink.id);
   if (it != sinks_.end()) {
     BOOST_LOG_TRIVIAL(info) << "session_manager:: sink id "
-                             << std::to_string(sink.id) << " is in use, updating";
+                          << std::to_string(sink.id) << " is in use, updating";
     // remove previous stream
-    const auto& info = (*it).second;
-    (void)driver_->remove_rtp_stream(info.handle);
+    (void)driver_->remove_rtp_stream((*it).second.handle);
+    igmp_.leave(config_->get_ip_addr_str(),
+           ip::address_v4((*it).second.stream.m_ui32DestIP).to_string());
   }
 
   auto ret = driver_->add_rtp_stream(info.stream, info.handle);
@@ -722,17 +751,12 @@ std::error_code SessionManager::add_sink(const StreamSink& sink) {
     if (it != sinks_.end()) {
       /* update operation failed */
       sinks_.erase(sink.id);
-      igmp_.leave(config_->get_ip_addr_str(),
-                  ip::address_v4(info.stream.m_ui32DestIP).to_string());
     }
     return ret;
   }
 
-  if (it == sinks_.end()) {
-    /* if add join multicast */
-    igmp_.join(config_->get_ip_addr_str(),
-               ip::address_v4(info.stream.m_ui32DestIP).to_string());
-  }
+  igmp_.join(config_->get_ip_addr_str(),
+             ip::address_v4(info.stream.m_ui32DestIP).to_string());
 
   // update sinks map
   sinks_[sink.id] = info;
@@ -823,21 +847,6 @@ void SessionManager::get_ptp_status(PTPStatus& status) const {
   status = ptp_status_;
 }
 
-static uint16_t crc16(const uint8_t* p, size_t len) {
-  uint8_t x;
-  uint16_t crc = 0xFFFF;
-
-  while (len--) {
-    x = crc >> 8 ^ *p++;
-    x ^= x >> 4;
-    crc = (crc << 8) ^
-          (static_cast<uint16_t>(x << 12)) ^
-          (static_cast<uint16_t>(x << 5)) ^ 
-          (static_cast<uint16_t>(x));
-  }
-  return crc;
-}
-
 size_t SessionManager::process_sap() {
   size_t sdp_len_sum = 0;
   // set to contain sources currently announced
@@ -855,11 +864,10 @@ size_t SessionManager::process_sap() {
       // compute source hash
       uint32_t msg_id_hash = (static_cast<uint32_t>(id) << 16) + msg_crc;
       // add/update this source in the announced sources
-      announced_sources_[msg_id_hash] =
-          std::make_pair(id, info.stream.m_ui32RTCPSrcIP);
-      // add this source to the active sources
+      announced_sources_[msg_id_hash] = info.stream.m_ui32RTCPSrcIP;
+      // add this source to the currently active sources
       active_sources.insert(msg_id_hash);
-      // remove this source from deleted sources
+      // remove this source from deleted sources (if present)
       deleted_sources_count_.erase(msg_id_hash);
       // send announcement for this source
       sap_.announcement(msg_crc, info.stream.m_ui32RTCPSrcIP, sdp);
@@ -869,15 +877,12 @@ size_t SessionManager::process_sap() {
   }
 
   // check for sources that are no longer announced and send deletion/s
-  for (auto const& [msg_id_hash, pair] : announced_sources_) {
-    const auto &id = pair.first;
-    const auto &src_addr = pair.second;
-
+  for (auto const& [msg_id_hash, src_addr] : announced_sources_) {
     // check if this source is no longer announced
     if (active_sources.find(msg_id_hash) ==
           active_sources.end()) {
       // retrieve deleted source SDP
-      std::string sdp = get_removed_source_sdp_(id, src_addr);
+      std::string sdp = get_removed_source_sdp_(msg_id_hash >> 16, src_addr);
       // send deletion for this source
       sap_.deletion(static_cast<uint16_t>(msg_id_hash), src_addr, sdp);
       // update amount of byte sent
@@ -903,16 +908,15 @@ size_t SessionManager::process_sap() {
   return sdp_len_sum;
 }
 
+
+using namespace std::chrono;
+using second_t  = duration<double, std::ratio<1> >;
+
 bool SessionManager::worker() {
-
-  using clock_ = std::chrono::high_resolution_clock;
-  using second_t  = std::chrono::duration<double, std::ratio<1> >;
-  using timepoint_t = std::chrono::time_point<clock_>;
-
   TPTPConfig ptp_config;
   TPTPStatus ptp_status;
-  timepoint_t sap_timepoint = clock_::now();
-  timepoint_t ptp_timepoint = clock_::now(); 
+  auto sap_timepoint = steady_clock::now();
+  auto ptp_timepoint = steady_clock::now();
   int sap_interval = 1;
   int ptp_interval = 0;
 
@@ -923,9 +927,9 @@ bool SessionManager::worker() {
 
   while (running_) {
     // check if it's time to update the PTP status
-    if (std::chrono::duration_cast<second_t> (clock_::now() - ptp_timepoint).count() > 
-          ptp_interval) {
-      ptp_timepoint = clock_::now();
+    if ((duration_cast<second_t>(steady_clock::now() - ptp_timepoint).count())
+          > ptp_interval) {
+      ptp_timepoint = steady_clock::now();
       if (driver_->get_ptp_config(ptp_config) ||
           driver_->get_ptp_status(ptp_status)) {
         BOOST_LOG_TRIVIAL(error)
@@ -943,10 +947,8 @@ bool SessionManager::worker() {
                  (reinterpret_cast<uint8_t*>(&ptp_status.ui64GMID)[5]),
                  (reinterpret_cast<uint8_t*>(&ptp_status.ui64GMID)[6]),
                  (reinterpret_cast<uint8_t*>(&ptp_status.ui64GMID)[7]));
-
         // update PTP clock status
         std::unique_lock ptp_lock(ptp_mutex_);
-
 	// update status
         ptp_status_.gmid = ptp_clock_id;
         ptp_status_.jitter = ptp_status.i32Jitter;
@@ -975,10 +977,10 @@ bool SessionManager::worker() {
       ptp_interval = 10;
     }
 
-    // check if it's time to send SAP announcements
-    if (std::chrono::duration_cast<second_t> (clock_::now() - sap_timepoint).count() > 
-          sap_interval) {
-      sap_timepoint = clock_::now();
+    // check if it's time to send sap announcements
+    if ((duration_cast<second_t>(steady_clock::now() - sap_timepoint).count())
+          > sap_interval) {
+      sap_timepoint = steady_clock::now();
 
       auto sdp_len_sum = process_sap();
 
@@ -1001,15 +1003,11 @@ bool SessionManager::worker() {
   }
 
   // at end, send deletion for all announced sources
-  for (auto const& [msg_id_hash, pair] : announced_sources_) {
-    const auto &id = pair.first;
-    const auto &addr = pair.second;
-
+  for (auto const& [msg_id_hash, src_addr] : announced_sources_) {
     // retrieve deleted source SDP
-    std::string sdp = get_removed_source_sdp_(id, addr);
-
+    std::string sdp = get_removed_source_sdp_(msg_id_hash >> 16, src_addr);
     // send deletion for this source
-    sap_.deletion(static_cast<uint16_t>(msg_id_hash), addr, sdp);
+    sap_.deletion(static_cast<uint16_t>(msg_id_hash), src_addr, sdp);
   }
 
   // leave PTP multicast addresses

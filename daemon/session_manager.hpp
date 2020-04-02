@@ -24,6 +24,7 @@
 #include <map>
 #include <shared_mutex>
 #include <thread>
+#include <list>
 
 #include "config.hpp"
 #include "driver_manager.hpp"
@@ -97,12 +98,13 @@ class SessionManager {
   static std::shared_ptr<SessionManager> create(
       std::shared_ptr<DriverManager> driver,
       std::shared_ptr<Config> config);
+  SessionManager() = delete;
   SessionManager(const SessionManager&) = delete;
   SessionManager& operator=(const SessionManager&) = delete;
-  virtual ~SessionManager(){ stop(); };
+  virtual ~SessionManager(){ terminate(); };
 
   // session manager interface
-  bool start() {
+  bool init() {
     if (!running_) {
       running_ = true;
       res_ = std::async(std::launch::async, &SessionManager::worker, this);
@@ -110,7 +112,7 @@ class SessionManager {
     return true;
   }
 
-  bool stop() {
+  bool terminate() {
     if (running_) {
       running_ = false;
       auto ret = res_.get();
@@ -179,19 +181,18 @@ class SessionManager {
   mutable std::shared_mutex sinks_mutex_;
 
   /* current announced sources */
-  std::map<uint32_t /* msg_id_hash */,
-           std::pair<uint8_t /* id */, uint32_t /* src_addr */> >
+  std::map<uint32_t /* msg_id_hash */, uint32_t /* src_addr */>
       announced_sources_;
 
   /* number of deletions sent for a  a deleted source */
-  std::map<uint32_t /* msg_id_hash */, int /* count */> 
+  std::unordered_map<uint32_t /* msg_id_hash */, int /* count */> 
       deleted_sources_count_;
 
   PTPConfig ptp_config_;
   PTPStatus ptp_status_;
   mutable std::shared_mutex ptp_mutex_;
 
-  SAP sap_;
+  SAP sap_{config_->get_sap_mcast_addr()};
   IGMP igmp_;
 };
 

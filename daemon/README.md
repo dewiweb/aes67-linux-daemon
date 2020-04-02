@@ -7,7 +7,8 @@ The daemon is responsible for:
 * communication and configuration of the device driver
 * provide an HTTP REST API for the daemon control and configuration
 * session handling and SDP parsing and creation
-* SAP discovery protocol implementation 
+* SAP discovery protocol and SAP browser
+* mDNS sources discovery (using Avahi) and SDP transfer via RTSP
 * IGMP handling for SAP and RTP sessions
 
 ## Configuration file ##
@@ -53,6 +54,13 @@ In case of failure the server returns a **text/plain** content type with the cat
 * **URL Params** none
 * **Body Type** application/json    
 * **Body** [PTP Config params](#ptp-config)
+
+### Get PTP Status ###
+* **URL** /api/ptp/status    
+* **Method** GET    
+* **URL Params** none    
+* **Body Type** application/json    
+* **Body** [PTP Status params](#ptp-status)
 
 ### Add RTP Source ###
 * **Description** add or update the RTP source specified by the *id*    
@@ -121,6 +129,14 @@ In case of failure the server returns a **text/plain** content type with the cat
 * **Body type** application/json    
 * **Body** [RTP Streams params](#rtp-streams)
 
+### Get all remote RTP Sources ###
+* **Description** retrieve all the remote sources collected via SAP
+* **URL** /api/browse/sources    
+* **Method** GET    
+* **URL Params** none    
+* **Body type** application/json    
+* **Body** [RTP Remote Sources params](#rtp-remote-sources)
+
 ## HTTP REST API structures ##
 
 ### JSON Config<a name="config"></a> ###
@@ -142,6 +158,7 @@ Example
       "frame_size_at_1fs": 192,
       "sample_rate": 44100,
       "max_tic_frame_size": 1024,
+      "sap_mcast_addr": "239.255.255.255",
       "sap_interval": 30,
       "mac_addr": "01:00:5e:01:00:01",
       "ip_addr": "127.0.0.1"
@@ -201,6 +218,10 @@ where:
 > JSON number specifying the max tick frame size.     
 > In case of a high value of *tic_frame_size_at_1fs*, this must be set to 8192.
 
+> **sap\_mcast\_addr**
+> JSON string specifying the SAP multicast address used for both announcing local sources and browsing remote sources.    
+> By default and according to SAP RFC this address is 224.2.127.254, but many devices use 239.255.255.255.
+
 > **sap\_interval**
 > JSON number specifying the SAP interval in seconds to use. Use 0 for automatic and RFC compliant interval. Default is 30secs.
 
@@ -211,6 +232,9 @@ where:
 > **ip\_addr**
 > JSON string specifying the IP address of the specified network device.
 > **_NOTE:_** This parameter is read-only and cannot be set. The server will determine the IP address of the network device at startup time and will monitor it periodically.
+
+> **mdns\_enabled**
+> JSON boolean specifying whether the mDNS discovery is enabled or disabled.
 
 ### JSON PTP Config<a name="ptp-config"></a> ###
 
@@ -229,6 +253,27 @@ where:
 > **dscp**
 > JSON number specifying the IP DSCP used in IPv4 header for PTP traffic.   
 > Valid values are 48 (CS6) and 46 (EF).
+
+### JSON PTP Status<a name="ptp-status"></a> ###
+
+Example
+
+    {
+      "status": "unlocked",
+      "gmid": "00-00-00-FF-FE-00-00-00",
+      "jitter": 0
+    }
+
+where:
+
+> **status**
+> JSON string specifying the PTP slave status. This can be *unlocked*, *locking* or *locked*.
+
+> **gmid**
+> JSON string specifying GrandMaster clock ID we are currently synchronized to.
+
+> **jitter**
+> JSON number specifying the measured PTP packet delay jitter.
 
 ### JSON RTP source<a name="rtp-source"></a> ###
 
@@ -263,8 +308,16 @@ where:
 > Valid values are L16 and L24.
 
 > **max\_sample\_per\_packet**
-> JSON number specifying the max number of samples contained in one RTP packet.
-> Valid values are 12, 16, 18, 96, 192.
+> JSON number specifying the max number of samples contained in one RTP packet.    
+> Valid values are 12, 16, 48, 96, 192.        
+> See the table below for correspondent max RTP packet duration: 
+> |     | 44.1Khz  | 48Khz   | 96Khz   |
+> |-----|----------|---------|---------|
+> | 12  | 272µs    | 250µs   | 125µs   |
+> | 16  | 363µs    | 333µs   | 166µs   |
+> | 48  | 1.088ms  | 1ms     | 500µs   |
+> | 96  | 2.177ms  | 2ms     | 1ms     |
+> | 192 | 4.353ms  | 4ms     | 2ms     |
 
 > **ttl**
 > JSON number specifying RTP packets Time To Live.
@@ -327,14 +380,15 @@ where:
 > JSON string specifying the IO name.
 
 > **delay**
-> JSON number specifying the playout delay of the sink in samples.
-> This value *must* be larger than the source frame size.
+> JSON number specifying the playout delay of the sink in samples.    
+> **_NOTE:_** The specified delay cannot be less than the source max samples size announced by the SDP file.
 
 > **use\_sdp**
 > JSON boolean specifying whether the source SDP file is fetched from the HTTP URL specified in the **source** parameter or the SDP in the **sdp** parameter is used.
 
 > **source**
-> JSON string specifying the HTTP URL of the source SDP file. This parameter is mandatory if **use\_sdp** is false.
+> JSON string specifying the URL of the source SDP file. At present HTTP and RTSP protocols are supported.
+> This parameter is mandatory if **use\_sdp** is false.
 
 > **sdp**
 > JSON string specifying the SDP of the source. This parameter is mandatory if **use\_sdp** is true.
@@ -483,4 +537,60 @@ where:
 > JSON array of the configured sinks. 
 > Every sink is identified by the JSON number **id** (in the range 0 - 63). 
 > See [RTP Sink params](#rtp-sink) for all the other parameters.
+
+### JSON Remote Sources<a name="rtp-remote-sources"></a> ###
+
+Example:
+
+    {
+      "remote_sources": [
+      {
+        "source": "SAP",
+        "id": "d00000a611d",
+        "name": "ALSA Source 2",
+        "address": "10.0.0.13",
+        "sdp": "v=0\no=- 2 0 IN IP4 10.0.0.13\ns=ALSA Source 2\nc=IN IP4 239.1.0.3/15\nt=0 0\na=clock-domain:PTPv2 0\nm=audio 5004 RTP/AVP 98\nc=IN IP4 239.1.0.3/15\na=rtpmap:98 L16/48000/2\na=sync-time:0\na=framecount:48\na=ptime:1\na=mediaclk:direct=0\na=ts-refclk:ptp=IEEE1588-2008:00-10-4B-FF-FE-7A-87-FC:0\na=recvonly\n",
+        "last_seen": 2768,
+        "announce_period": 30 
+      }, 
+      {
+        "source": "SAP",
+        "id": "d00000a8dd5",
+        "name": "ALSA Source 1",
+        "address": "10.0.0.13",
+        "sdp": "v=0\no=- 1 0 IN IP4 10.0.0.13\ns=ALSA Source 1\nc=IN IP4 239.1.0.2/15\nt=0 0\na=clock-domain:PTPv2 0\nm=audio 5004 RTP/AVP 98\nc=IN IP4 239.1.0.2/15\na=rtpmap:98 L16/48000/2\na=sync-time:0\na=framecount:48\na=ptime:1\na=mediaclk:direct=0\na=ts-refclk:ptp=IEEE1588-2008:00-10-4B-FF-FE-7A-87-FC:0\na=recvonly\n",
+        "last_seen": 2768,
+        "announce_period": 30 
+      }  ]
+    }
+
+
+where:
+
+> **remote\_sources**
+> JSON array of the remote sources collected so far.
+> Every source is identified by the unique JSON string **id**.
+
+> **source**
+> JSON string specifying the protocol used to collect the remote source.
+
+> **id**
+> JSON string specifying the remote source unique id.
+
+> **name**
+> JSON string specifying the remote source name announced in the SDP file.
+
+> **address**
+> JSON string specifying the remote source address announced.
+
+> **sdp**
+> JSON string specifying the remote source SDP.
+
+> **last\_seen**
+> JSON number specifying the last time the source was announced.
+> This time is expressed in seconds since the daemon startup.
+
+> **announce_period**
+> JSON number specifying the meausured period in seconds between the last source announcements.
+> A remote source is automatically removed if it doesn't get announced for **announce\_period** x 10 seconds.
 

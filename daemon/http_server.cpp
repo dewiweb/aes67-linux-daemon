@@ -77,7 +77,7 @@ static inline void set_error(
   res.body = message;
 }
 
-bool HttpServer::start() {
+bool HttpServer::init() {
   /* setup http operations */
   if (!svr_.is_valid()) {
     return false;
@@ -85,7 +85,7 @@ bool HttpServer::start() {
 
   svr_.set_base_dir(config_->get_http_base_dir().c_str());
 
-  svr_.Get("(/|/Config|/PTP|/Sources|/Sinks)", [&](const Request& req, Response& res) {
+  svr_.Get("(/|/Config|/PTP|/Sources|/Sinks|/Browser)", [&](const Request& req, Response& res) {
     std::ifstream file(config_->get_http_base_dir() + "/index.html");
     std::stringstream buffer;
     buffer << file.rdbuf();
@@ -280,6 +280,13 @@ bool HttpServer::start() {
     }
   });
 
+  /* get remote sources */
+  svr_.Get("/api/browse/sources", [this](const Request& req, Response& res) {
+    auto const sources = browser_->get_remote_sources();
+    set_headers(res, "application/json");
+    res.body = remote_sources_to_json(sources);
+  });
+
   svr_.set_logger([](const Request& req, const Response& res) {
     if (res.status == 200) {
       BOOST_LOG_TRIVIAL(info) << "http_server:: " << req.method << " "
@@ -318,7 +325,7 @@ bool HttpServer::start() {
   return retry;
 }
 
-bool HttpServer::stop() {
+bool HttpServer::terminate() {
   BOOST_LOG_TRIVIAL(info) << "http_server: stopping ... ";
   svr_.stop();
   return res_.get();

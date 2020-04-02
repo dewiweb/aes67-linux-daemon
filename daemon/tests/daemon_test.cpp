@@ -18,6 +18,7 @@
 //
 
 #define CPPHTTPLIB_PAYLOAD_MAX_LENGTH 4096 //max for SDP file 
+#define CPPHTTPLIB_READ_TIMEOUT_SECOND 30
 #include <httplib.h>
 #include <boost/foreach.hpp>
 #include <boost/asio.hpp>
@@ -39,8 +40,8 @@ constexpr static const char g_daemon_address[] = "127.0.0.1";
 constexpr static uint16_t g_daemon_port = 9999;
 constexpr static const char g_sap_address[] = "224.2.127.254";
 constexpr static uint16_t g_sap_port = 9875;
-constexpr static uint16_t udp_size = 1024;
-constexpr static uint16_t sap_header = 24;
+constexpr static uint16_t g_udp_size = 1024;
+constexpr static uint16_t g_sap_header_len = 24;
 
 using namespace boost::process;
 using namespace boost::asio::ip;
@@ -49,15 +50,15 @@ using namespace boost::asio;
 struct DaemonInstance {
   DaemonInstance() {
     BOOST_TEST_MESSAGE("Starting up test daemon instance ...");
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    while (daemon_.running()) {
+    int retry = 10;
+    while (retry-- && daemon_.running()) {
       BOOST_TEST_MESSAGE("Checking daemon instance ...");
       httplib::Client cli(g_daemon_address, g_daemon_port);
       auto res = cli.Get("/");
       if (res) {
         break;
       }
-      daemon_.wait_for(std::chrono::seconds(1));
+      std::this_thread::sleep_for(std::chrono::seconds(1));
     }
     BOOST_REQUIRE(daemon_.running());
     ok = true;
@@ -100,15 +101,19 @@ struct Client {
     socket_.set_option(
         multicast::join_group(address::from_string(g_sap_address).to_v4(),
                               address::from_string(g_daemon_address).to_v4()));
+
+    cli_.set_timeout_sec(30);
   }
 
   bool is_alive() {
     auto res = cli_.Get("/");
+    BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
     return (res->status == 200);
   }
 
   std::pair<bool, std::string> get_config() {
     auto res = cli_.Get("/api/config");
+    BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
     return std::make_pair(res->status == 200, res->body);
   }
 
@@ -116,16 +121,19 @@ struct Client {
     std::ostringstream os;
     os << "{ \"domain\": " << domain << ", \"dscp\": " << dscp << " }";
     auto res = cli_.Post("/api/ptp/config", os.str(), "application/json");
+    BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
     return (res->status == 200);
   }
 
   std::pair<bool, std::string> get_ptp_status() {
     auto res = cli_.Get("/api/ptp/status");
+    BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
     return std::make_pair(res->status == 200, res->body);
   }
 
   std::pair<bool, std::string> get_ptp_config() {
     auto res = cli_.Get("/api/ptp/config");
+    BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
     return std::make_pair(res->status == 200, res->body);
   }
 
@@ -146,42 +154,49 @@ struct Client {
     )";
     std::string url = std::string("/api/source/") + std::to_string(id);
     auto res = cli_.Put(url.c_str(), json, "application/json");
+    BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
     return (res->status == 200);
   }
 
   std::pair<bool, std::string> get_source_sdp(int id) {
     std::string url = std::string("/api/source/sdp/") + std::to_string(id);
     auto res = cli_.Get(url.c_str());
+    BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
     return std::make_pair(res->status == 200, res->body);
   }
 
   std::pair<bool, std::string> get_sink_status(int id) {
     std::string url = std::string("/api/sink/status/") + std::to_string(id);
     auto res = cli_.Get(url.c_str());
+    BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
     return std::make_pair(res->status == 200, res->body);
   }
 
   std::pair<bool, std::string> get_streams() {
     std::string url = std::string("/api/streams");
     auto res = cli_.Get(url.c_str());
+    BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
     return std::make_pair(res->status == 200, res->body);
   }
 
   std::pair<bool, std::string> get_sources() {
     std::string url = std::string("/api/sources");
     auto res = cli_.Get(url.c_str());
+    BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
     return std::make_pair(res->status == 200, res->body);
   }
 
   std::pair<bool, std::string> get_sinks() {
     std::string url = std::string("/api/sinks");
     auto res = cli_.Get(url.c_str());
+    BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
     return std::make_pair(res->status == 200, res->body);
   }
 
   bool remove_source(int id) {
     std::string url = std::string("/api/source/") + std::to_string(id);
     auto res = cli_.Delete(url.c_str());
+    BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
     return (res->status == 200);
   }
 
@@ -201,6 +216,7 @@ struct Client {
 
     std::string url = std::string("/api/sink/") + std::to_string(id);
     auto res = cli_.Put(url.c_str(), json, "application/json");
+    BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
     return (res->status == 200);
   }
 
@@ -222,27 +238,29 @@ struct Client {
         std::string("/api/source/sdp/") + std::to_string(id) + "\"\n}";
     std::string url = std::string("/api/sink/") + std::to_string(id);
     auto res = cli_.Put(url.c_str(), json, "application/json");
+    BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
     return (res->status == 200);
   }
 
   bool remove_sink(int id) {
     std::string url = std::string("/api/sink/") + std::to_string(id);
     auto res = cli_.Delete(url.c_str());
+    BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
     return (res->status == 200);
   }
 
   bool sap_wait_announcement(int id, const std::string& sdp, int count = 1) {
-    char data[udp_size];
+    char data[g_udp_size];
     while (count-- > 0) {
       BOOST_TEST_MESSAGE("waiting announcement for source " +
                          std::to_string(id));
       std::string sap_sdp;
       do {
-        auto len = socket_.receive(boost::asio::buffer(data, udp_size));
-        if (len <= sap_header) {
+        auto len = socket_.receive(boost::asio::buffer(data, g_udp_size));
+        if (len <= g_sap_header_len) {
           continue;
 	}
-	sap_sdp.assign(data + sap_header, data + len);
+	sap_sdp.assign(data + g_sap_header_len, data + len);
       } while(data[0] != 0x20 || sap_sdp != sdp);
       BOOST_CHECK_MESSAGE(true, "SAP announcement SDP and source SDP match");
     }
@@ -250,14 +268,14 @@ struct Client {
   }
 
   void sap_wait_all_deletions() {
-    char data[udp_size];
+    char data[g_udp_size];
     std::set<uint8_t> ids;
     while (ids.size() < 64) {
-      auto len = socket_.receive(boost::asio::buffer(data, udp_size));
-      if (len <= sap_header) {
+      auto len = socket_.receive(boost::asio::buffer(data, g_udp_size));
+      if (len <= g_sap_header_len) {
         continue;
       }
-      std::string sap_sdp_(data + sap_header, data + len);
+      std::string sap_sdp_(data + g_sap_header_len, data + len);
       if (data[0] == 0x24 && sap_sdp_.length() > 3) {
          //o=- 56 0 IN IP4 127.0.0.1
          ids.insert(std::atoi(sap_sdp_.c_str() + 3));
@@ -268,20 +286,27 @@ struct Client {
   }
 
   bool sap_wait_deletion(int id, const std::string& sdp, int count = 1) {
-    char data[udp_size];
+    char data[g_udp_size];
     while (count-- > 0) {
       BOOST_TEST_MESSAGE("waiting deletion for source " + std::to_string(id));
       std::string sap_sdp;
       do {
-        auto len = socket_.receive(boost::asio::buffer(data, udp_size));
-        if (len <= sap_header) {
+        auto len = socket_.receive(boost::asio::buffer(data, g_udp_size));
+        if (len <= g_sap_header_len) {
           continue;
 	}
-	sap_sdp.assign(data + sap_header, data + len);
+	sap_sdp.assign(data + g_sap_header_len, data + len);
       } while(data[0] != 0x24 || sdp.find(sap_sdp) == std::string::npos);
       BOOST_CHECK_MESSAGE(true, "SAP deletion SDP matches");
     }
     return true;
+  }
+
+  std::pair<bool, std::string> get_remote_sources() {
+    std::string url = std::string("/api/browse/sources");
+    auto res = cli_.Get(url.c_str());
+    BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
+    return std::make_pair(res->status == 200, res->body);
   }
 
  private:
@@ -327,7 +352,7 @@ BOOST_AUTO_TEST_CASE(get_config) {
   BOOST_CHECK_MESSAGE(tic_frame_size_at_1fs == 192, "config as excepcted");
   BOOST_CHECK_MESSAGE(max_tic_frame_size == 1024, "config as excepcted");
   BOOST_CHECK_MESSAGE(sample_rate == 44100, "config as excepcted");
-  BOOST_CHECK_MESSAGE(rtp_mcast_base == "239.2.0.1", "config as excepcted");
+  BOOST_CHECK_MESSAGE(rtp_mcast_base == "239.1.0.1", "config as excepcted");
   BOOST_CHECK_MESSAGE(rtp_port == 6004, "config as excepcted");
   BOOST_CHECK_MESSAGE(ptp_domain == 0, "config as excepcted");
   BOOST_CHECK_MESSAGE(ptp_dscp == 46, "config as excepcted");
@@ -336,7 +361,7 @@ BOOST_AUTO_TEST_CASE(get_config) {
   BOOST_CHECK_MESSAGE(syslog_server == "255.255.255.254:1234", "config as excepcted");
   BOOST_CHECK_MESSAGE(status_file == "", "config as excepcted");
   BOOST_CHECK_MESSAGE(interface_name == "lo", "config as excepcted");
-  BOOST_CHECK_MESSAGE(mac_addr == "01:00:5e:01:00:01", "config as excepcted");
+  BOOST_CHECK_MESSAGE(mac_addr == "00:00:00:00:00:00", "config as excepcted");
   BOOST_CHECK_MESSAGE(ip_addr == "127.0.0.1", "config as excepcted");
 }
 
@@ -432,7 +457,30 @@ BOOST_AUTO_TEST_CASE(source_check_sap) {
   cli.sap_wait_announcement(0, sdp.second);
   BOOST_REQUIRE_MESSAGE(cli.remove_source(0), "removed source 0");
   cli.sap_wait_deletion(0, sdp.second, 3);
-  std::this_thread::sleep_for(std::chrono::seconds(10));
+}
+
+BOOST_AUTO_TEST_CASE(source_check_browser) {
+  Client cli;
+  BOOST_REQUIRE_MESSAGE(cli.add_source(0), "added source 0");
+  auto sdp = cli.get_source_sdp(0);
+  BOOST_REQUIRE_MESSAGE(sdp.first, "got source sdp 0");
+  cli.sap_wait_announcement(0, sdp.second);
+  auto json = cli.get_remote_sources();
+  BOOST_REQUIRE_MESSAGE(json.first, "got remote sources");
+  boost::property_tree::ptree pt;
+  std::stringstream ss(json.second);
+  boost::property_tree::read_json(ss, pt);
+  BOOST_FOREACH (auto const& v, pt.get_child("remote_sources")) {
+    BOOST_REQUIRE_MESSAGE(v.second.get<std::string>("sdp") == sdp.second,
+                          "returned source " + v.second.get<std::string>("id"));
+  }
+  BOOST_REQUIRE_MESSAGE(cli.remove_source(0), "removed source 0");
+  cli.sap_wait_deletion(0, sdp.second, 3);
+  json = cli.get_remote_sources();
+  BOOST_REQUIRE_MESSAGE(json.first, "got remote sources");
+  std::stringstream ss1(json.second);
+  boost::property_tree::read_json(ss1, pt);
+  BOOST_REQUIRE_MESSAGE(pt.get_child("remote_sources").size() == 0, "no remote sources");
 }
 
 BOOST_AUTO_TEST_CASE(sink_check_status) {
@@ -443,9 +491,9 @@ BOOST_AUTO_TEST_CASE(sink_check_status) {
   boost::property_tree::ptree pt;
   std::stringstream ss(json.second);
   boost::property_tree::read_json(ss, pt);
-  auto is_sink_muted = pt.get<bool>("sink_flags.muted");
+  //auto is_sink_muted = pt.get<bool>("sink_flags.muted");
   auto is_sink_some_muted = pt.get<bool>("sink_flags.some_muted");
-  BOOST_REQUIRE_MESSAGE(is_sink_muted, "sink is not receiving packets");
+  //BOOST_REQUIRE_MESSAGE(is_sink_muted, "sink is not receiving packets");
   BOOST_REQUIRE_MESSAGE(!is_sink_some_muted, "sink is not receiving packets");
   BOOST_REQUIRE_MESSAGE(cli.remove_sink(0), "removed sink 0");
 }
@@ -578,7 +626,7 @@ BOOST_AUTO_TEST_CASE(add_remove_update_check_all) {
   }
 }
 
-BOOST_AUTO_TEST_CASE(add_remove_check_sap_all) {
+BOOST_AUTO_TEST_CASE(add_remove_check_sap_browser_all) {
   Client cli;
   for (int id = 0; id < 64; id++) {
     BOOST_REQUIRE_MESSAGE(cli.add_source(id),
@@ -589,15 +637,20 @@ BOOST_AUTO_TEST_CASE(add_remove_check_sap_all) {
     BOOST_REQUIRE_MESSAGE(sdp.first, std::string("got source sdp ") + std::to_string(id));
     cli.sap_wait_announcement(id, sdp.second);
   }
+  auto json = cli.get_remote_sources();
+  BOOST_REQUIRE_MESSAGE(json.first, "got remote sources");
+  boost::property_tree::ptree pt;
+  std::stringstream ss(json.second);
+  boost::property_tree::read_json(ss, pt);
+  BOOST_REQUIRE_MESSAGE(pt.get_child("remote_sources").size() == 64, "found 64 remote sources");
   for (int id = 0; id < 64; id++) {
     BOOST_REQUIRE_MESSAGE(cli.add_sink_sdp(id),
                           std::string("added sink ") + std::to_string(id));
   }
-  auto json = cli.get_streams();
+  json = cli.get_streams();
   BOOST_REQUIRE_MESSAGE(json.first, "got streams");
-  boost::property_tree::ptree pt;
-  std::stringstream ss(json.second);
-  boost::property_tree::read_json(ss, pt);
+  std::stringstream ss1(json.second);
+  boost::property_tree::read_json(ss1, pt);
   uint8_t id = 0;
   BOOST_FOREACH (auto const& v, pt.get_child("sources")) {
     BOOST_REQUIRE_MESSAGE(v.second.get<uint8_t>("id") == id, 
@@ -615,6 +668,11 @@ BOOST_AUTO_TEST_CASE(add_remove_check_sap_all) {
                           std::string("removed source ") + std::to_string(id));
   }
   cli.sap_wait_all_deletions();
+  json = cli.get_remote_sources();
+  BOOST_REQUIRE_MESSAGE(json.first, "got remote sources");
+  std::stringstream ss2(json.second);
+  boost::property_tree::read_json(ss2, pt);
+  BOOST_REQUIRE_MESSAGE(pt.get_child("remote_sources").size() == 0, "no remote sources");
   for (int id = 0; id < 64; id++) {
     BOOST_REQUIRE_MESSAGE(cli.remove_sink(id),
                           std::string("removed sink ") + std::to_string(id));
